@@ -1,0 +1,44 @@
+# Skill Market Service Configuration
+#
+# This service runs independently from the main SOI agent runtime.
+# It focuses exclusively on skill discovery (search) and distribution (download/install).
+#
+# Configuration priority (highest wins):
+#   1. Environment variables (SKILL_MARKET_*)
+#   2. CLI flags (--host, --port, --db, --skills-dir, --config)
+#   3. This config file
+#   4. Built-in defaults
+
+# ── HTTP server ──────────────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"       # Listen address (SKILL_MARKET_HOST)
+  port: 9090             # Listen port    (SKILL_MARKET_PORT)
+
+# ── Storage ──────────────────────────────────────────────────────────────
+storage:
+  # Database DSN.
+  #   SQLite:   "sm.db"  or  "./data/sm.db"
+  #   Postgres: "postgres://user:pass@host:5432/skillmarket?sslmode=disable"
+  db: "./data/sm.db"     # (SKILL_MARKET_DB)
+
+  # Root directory where skill folders live.
+  # Each subdirectory containing a skill.yaml is treated as a skill.
+  skills_dir: "./skills" # (SKILL_MARKET_SKILLS_DIR)
+
+# ── Market sources ───────────────────────────────────────────────────────
+# Initial skill registry endpoints. These are seeded into the database on
+# first start. Afterwards, sources are managed via the REST API (persisted
+# in the database, not read from this file on subsequent starts).
+market:
+  sources:
+    - name: "official"
+      url:  "https://raw.githubusercontent.com/soi-dev/skills/main/index.json"
+      type: "http"
+      enabled: true
+      priority: 10
+  # Add more sources:
+  #   - name: "community"
+  #     url: "https://community-skills.example.com/index.json"
+  #     type: "http"
+  #     enabled: true
+  #     priority: 5
