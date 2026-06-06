@@ -1,4 +1,4 @@
-module soi.dev/skill-market
+module github.com/Source-of-Intelligence/soi-hub
 
 go 1.22.0
 

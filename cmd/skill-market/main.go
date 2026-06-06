@@ -29,9 +29,9 @@ import (
 	"github.com/gorilla/mux"
 	"gopkg.in/yaml.v3"
 
-	"soi.dev/skill-market/internal/skill"
-	"soi.dev/skill-market/internal/skillmarket"
-	skillpkg "soi.dev/skill-market/pkg/skill"
+	"github.com/Source-of-Intelligence/soi-hub/internal/skill"
+	"github.com/Source-of-Intelligence/soi-hub/internal/skillmarket"
+	skillpkg "github.com/Source-of-Intelligence/soi-hub/pkg/skill"
 )
 
 type Server struct {

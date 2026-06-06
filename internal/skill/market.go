@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	skillpkg "soi.dev/skill-market/pkg/skill"
+	skillpkg "github.com/Source-of-Intelligence/soi-hub/pkg/skill"
 )
 
 // Market manages skill sources and online search.
