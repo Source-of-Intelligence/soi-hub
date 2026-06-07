@@ -105,13 +105,11 @@ type Provides struct {
 	// Tools provided by this skill
 	Tools []ToolDef `yaml:"tools,omitempty"`
 	// Trigger configuration at provides level
-	Trigger *Trigger `yaml:"triggers,omitempty"`
+	Triggers *Trigger `yaml:"triggers,omitempty"`
 	// Prompts provided by this skill
 	Prompts []PromptDef `yaml:"prompts,omitempty"`
 	// Resources provided by this skill
 	Resources []ResourceDef `yaml:"resources,omitempty"`
-	// Triggers for skill activation (legacy compatibility)
-	Triggers []string `yaml:"triggers,omitempty"`
 	// Instructions for skill execution (legacy compatibility)
 	Instructions string `yaml:"instructions,omitempty"`
 }

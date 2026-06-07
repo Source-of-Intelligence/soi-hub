@@ -74,7 +74,7 @@ func loadConfig(configPath string) (*config, error) {
 }
 
 func findConfigFile() string {
-	for _, p := range []string{"./skill-market.yaml.template", "./skill-market.yml", "./configs/skill-market.yaml.template", "./configs/skill-market.yml", filepath.Join(os.ExpandEnv("$HOME"), ".soi", "skill-market.yaml.template")} {
+	for _, p := range []string{"./configs/skill-market.yaml", "./skill-market.yaml.template", "./skill-market.yml", "./configs/skill-market.yaml.template", "./configs/skill-market.yml", filepath.Join(os.ExpandEnv("$HOME"), ".soi", "skill-market.yaml.template")} {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
