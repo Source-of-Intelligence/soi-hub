@@ -29,11 +29,14 @@ import (
 	"github.com/gorilla/mux"
 	"gopkg.in/yaml.v3"
 
+	"github.com/Source-of-Intelligence/soi-hub/internal/pkg/auth"
+	"github.com/Source-of-Intelligence/soi-hub/internal/pkg/validate"
 	"github.com/Source-of-Intelligence/soi-hub/internal/skill"
 	"github.com/Source-of-Intelligence/soi-hub/internal/skillmarket"
 	skillpkg "github.com/Source-of-Intelligence/soi-hub/pkg/skill"
 )
 
+// Server is the HTTP server for the skill market service.
 type Server struct {
 	cfg       *config
 	market    *skill.Market
@@ -89,6 +92,10 @@ func main() {
 		slog.Info("loaded sources from database", "count", len(srcs))
 	} else {
 		for _, s := range cfg.Market.Sources {
+			if vErr := validate.SourceURL(s.URL); vErr != nil {
+				slog.Warn("skipping invalid source URL", "name", s.Name, "error", vErr)
+				continue
+			}
 			store.AddSource(ctx, &skillmarket.MarketSource{Name: s.Name, URL: s.URL, Type: s.Type, Enabled: s.Enabled, Priority: s.Priority})
 			market.AddSource(&skillpkg.Source{Name: s.Name, URL: s.URL, Type: s.Type, Enabled: s.Enabled, Priority: s.Priority})
 		}
@@ -100,7 +107,20 @@ func main() {
 	srv := &Server{cfg: cfg, market: market, store: store, skillsDir: absSkillsDir, router: router}
 	srv.setupRoutes()
 	srv.rebuildIndex()
-	httpServer := &http.Server{Addr: cfg.listenAddr(), Handler: loggingMiddleware(corsMiddleware(router)), ReadTimeout: 30 * time.Second, WriteTimeout: 120 * time.Second, IdleTimeout: 60 * time.Second}
+
+	// Build middleware chain: logging -> auth -> CORS -> router
+	var handler http.Handler = router
+	handler = corsMiddleware(handler, cfg.Auth.CORSOrigins)
+	handler = auth.Middleware(cfg.Auth.APIKeys)(handler)
+	handler = loggingMiddleware(handler)
+
+	httpServer := &http.Server{
+		Addr:         cfg.listenAddr(),
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -124,6 +144,7 @@ func detectBackend(dsn string) string {
 	return "sqlite"
 }
 
+// localSkill is the JSON representation of an installed skill.
 type localSkill struct {
 	Name, Version, Description, Author, Runtime, Path, Source string
 	Tags, Tools                                               []string
@@ -147,7 +168,12 @@ type yamlMeta struct {
 }
 
 func toLocalSkill(sk *skillmarket.InstalledSkill) localSkill {
-	return localSkill{Name: sk.Name, Version: sk.Version, Description: sk.Description, Author: sk.Author, Runtime: sk.Runtime, Tags: sk.Tags, Tools: sk.Tools, Path: sk.Name, HasWasm: sk.HasWasm, HasSoi: sk.HasSoi, Size: sk.SizeBytes, Source: "market"}
+	return localSkill{
+		Name: sk.Name, Version: sk.Version, Description: sk.Description,
+		Author: sk.Author, Runtime: sk.Runtime, Tags: sk.Tags, Tools: sk.Tools,
+		Path: sk.Name, HasWasm: sk.HasWasm, HasSoi: sk.HasSoi,
+		Size: sk.SizeBytes, Source: sk.SourceType,
+	}
 }
 
 func (s *Server) rebuildIndex() {
@@ -168,7 +194,12 @@ func (s *Server) rebuildIndex() {
 	s.index = idx
 	s.indexMu.Unlock()
 	for _, sk := range idx {
-		s.store.UpsertSkill(ctx, &skillmarket.InstalledSkill{Name: sk.Name, Version: sk.Version, Description: sk.Description, Author: sk.Author, Runtime: sk.Runtime, Tags: sk.Tags, Tools: sk.Tools, HasWasm: sk.HasWasm, HasSoi: sk.HasSoi, SizeBytes: sk.Size, SourceType: "local", InstallTime: time.Now()})
+		s.store.UpsertSkill(ctx, &skillmarket.InstalledSkill{
+			Name: sk.Name, Version: sk.Version, Description: sk.Description,
+			Author: sk.Author, Runtime: sk.Runtime, Tags: sk.Tags, Tools: sk.Tools,
+			HasWasm: sk.HasWasm, HasSoi: sk.HasSoi, SizeBytes: sk.Size,
+			SourceType: "local", InstallTime: time.Now(),
+		})
 	}
 	slog.Info("built skill index from filesystem (synced to db)", "count", len(idx))
 }
@@ -193,53 +224,124 @@ func (s *Server) appendCachedSkill(sk localSkill) {
 	s.index = append(s.index, sk)
 }
 
+func (s *Server) removeCachedSkill(name string) {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	for i, e := range s.index {
+		if e.Name == name {
+			s.index = append(s.index[:i], s.index[i+1:]...)
+			return
+		}
+	}
+}
+
+// =============================================================================
+// Routes
+// =============================================================================
+
 func (s *Server) setupRoutes() {
 	r := s.router
 	r.HandleFunc("/health", s.handleHealth).Methods("GET")
 	api := r.PathPrefix("/api/v1").Subrouter()
+
+	// Market
 	api.HandleFunc("/market/search", s.handleMarketSearch).Methods("GET")
 	api.HandleFunc("/market/sources", s.handleListSources).Methods("GET")
 	api.HandleFunc("/market/sources", s.handleAddSource).Methods("POST")
+	api.HandleFunc("/market/sources/{name}", s.handleGetSource).Methods("GET")
+	api.HandleFunc("/market/sources/{name}", s.handleUpdateSource).Methods("PUT")
 	api.HandleFunc("/market/sources/{name}", s.handleRemoveSource).Methods("DELETE")
+
+	// Skills
 	api.HandleFunc("/skills", s.handleListSkills).Methods("GET")
 	api.HandleFunc("/skills/search", s.handleSearchSkills).Methods("GET")
 	api.HandleFunc("/skills/{name}", s.handleGetSkill).Methods("GET")
+	api.HandleFunc("/skills/{name}", s.handleDeleteSkill).Methods("DELETE")
 	api.HandleFunc("/skills/{name}/download", s.handleDownloadSkill).Methods("GET")
 	api.HandleFunc("/skills/{name}/download/{file:.*}", s.handleDownloadSkillFile).Methods("GET")
 	api.HandleFunc("/skills/import", s.handleImportSkill).Methods("POST")
+
+	// History
+	api.HandleFunc("/history", s.handleListHistory).Methods("GET")
+	api.HandleFunc("/skills/{name}/history", s.handleSkillHistory).Methods("GET")
+
+	// Stats
 	api.HandleFunc("/stats", s.handleStats).Methods("GET")
 }
 
+// =============================================================================
+// Handlers
+// =============================================================================
+
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, map[string]any{"status": "ok", "service": "skill-market"})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "service": "skill-market"})
 }
+
+// --- Market Search ---
 
 func (s *Server) handleMarketSearch(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
+	if err := validate.SearchQuery(query); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
 	results, err := s.market.Search(r.Context(), query)
 	if err != nil {
-		writeError(w, 500, err.Error())
+		slog.Error("market search failed", "error", err)
+		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
 	}
 	if results == nil {
 		results = []*skillpkg.SearchResult{}
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "query": query, "count": len(results), "results": results})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "query": query, "count": len(results), "results": results})
 }
 
+// --- Sources ---
+
 func (s *Server) handleListSources(w http.ResponseWriter, r *http.Request) {
-	srcs, _ := s.store.ListSources(r.Context())
-	writeJSON(w, 200, map[string]any{"ok": true, "count": len(srcs), "sources": srcs})
+	srcs, err := s.store.ListSources(r.Context())
+	if err != nil {
+		slog.Error("failed to list sources", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to list sources", "INTERNAL_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(srcs), "sources": srcs})
+}
+
+func (s *Server) handleGetSource(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	if err := validate.SourceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
+	srcs, err := s.store.ListSources(r.Context())
+	if err != nil {
+		slog.Error("failed to list sources", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to list sources", "INTERNAL_ERROR")
+		return
+	}
+	for _, src := range srcs {
+		if src.Name == name {
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": src})
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "source not found: "+name, "NOT_FOUND")
 }
 
 func (s *Server) handleAddSource(w http.ResponseWriter, r *http.Request) {
 	var src skillpkg.Source
 	if err := json.NewDecoder(r.Body).Decode(&src); err != nil {
-		writeError(w, 400, "invalid JSON: "+err.Error())
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "BAD_REQUEST")
 		return
 	}
-	if src.Name == "" || src.URL == "" {
-		writeError(w, 400, "name and url are required")
+	if err := validate.SourceName(src.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
+	if err := validate.SourceURL(src.URL); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
 		return
 	}
 	if src.Type == "" {
@@ -248,61 +350,176 @@ func (s *Server) handleAddSource(w http.ResponseWriter, r *http.Request) {
 	if src.Priority == 0 {
 		src.Priority = 5
 	}
-	src.Enabled = true
-	s.store.AddSource(r.Context(), &skillmarket.MarketSource{Name: src.Name, URL: src.URL, Type: src.Type, Enabled: src.Enabled, Priority: src.Priority})
+	if !src.Enabled {
+		src.Enabled = true
+	}
+	if err := s.store.AddSource(r.Context(), &skillmarket.MarketSource{
+		Name: src.Name, URL: src.URL, Type: src.Type,
+		Enabled: src.Enabled, Priority: src.Priority,
+	}); err != nil {
+		slog.Error("failed to add source", "name", src.Name, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to add source", "INTERNAL_ERROR")
+		return
+	}
 	s.market.AddSource(&src)
-	writeJSON(w, 201, map[string]any{"ok": true, "data": src})
+	slog.Info("source added", "name", src.Name, "url", src.URL)
+	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "data": src})
+}
+
+func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	if err := validate.SourceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
+	var req struct {
+		Enabled  *bool `json:"enabled"`
+		Priority *int  `json:"priority"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error(), "BAD_REQUEST")
+		return
+	}
+
+	// Get existing source
+	srcs, err := s.store.ListSources(r.Context())
+	if err != nil {
+		slog.Error("failed to list sources", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to list sources", "INTERNAL_ERROR")
+		return
+	}
+	var existing *skillmarket.MarketSource
+	for _, src := range srcs {
+		if src.Name == name {
+			existing = src
+			break
+		}
+	}
+	if existing == nil {
+		writeError(w, http.StatusNotFound, "source not found: "+name, "NOT_FOUND")
+		return
+	}
+	if req.Enabled != nil {
+		existing.Enabled = *req.Enabled
+	}
+	if req.Priority != nil {
+		existing.Priority = *req.Priority
+	}
+	if err := s.store.AddSource(r.Context(), existing); err != nil {
+		slog.Error("failed to update source", "name", name, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to update source", "INTERNAL_ERROR")
+		return
+	}
+	// Update in-memory market
+	s.market.RemoveSource(name)
+	s.market.AddSource(&skillpkg.Source{
+		Name: existing.Name, URL: existing.URL, Type: existing.Type,
+		Enabled: existing.Enabled, Priority: existing.Priority,
+	})
+	slog.Info("source updated", "name", name)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": existing})
 }
 
 func (s *Server) handleRemoveSource(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
+	if err := validate.SourceName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
 	if err := s.store.RemoveSource(r.Context(), name); err != nil {
-		code := 500
-		if strings.Contains(err.Error(), "not found") {
-			code = 404
+		if isNotFound(err) {
+			writeError(w, http.StatusNotFound, err.Error(), "NOT_FOUND")
+			return
 		}
-		writeError(w, code, err.Error())
+		slog.Error("failed to remove source", "name", name, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to remove source", "INTERNAL_ERROR")
 		return
 	}
 	s.market.RemoveSource(name)
-	writeJSON(w, 200, map[string]any{"ok": true, "removed": name})
+	slog.Info("source removed", "name", name)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": name})
 }
 
-func (s *Server) handleListSkills(w http.ResponseWriter, _ *http.Request) {
+// --- Skills ---
+
+func (s *Server) handleListSkills(w http.ResponseWriter, r *http.Request) {
 	skills := s.getCachedSkills()
-	writeJSON(w, 200, map[string]any{"ok": true, "count": len(skills), "items": skills})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(skills), "items": skills})
 }
 
 func (s *Server) handleGetSkill(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
+	if err := validate.SkillName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
 	if sk, err := s.store.GetSkill(r.Context(), name); err == nil && sk != nil {
-		writeJSON(w, 200, map[string]any{"ok": true, "data": toLocalSkill(sk)})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": toLocalSkill(sk)})
 		return
 	}
 	for _, ls := range s.getCachedSkills() {
 		if ls.Name == name {
-			writeJSON(w, 200, map[string]any{"ok": true, "data": ls})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "data": ls})
 			return
 		}
 	}
-	writeError(w, 404, "skill not found: "+name)
+	writeError(w, http.StatusNotFound, "skill not found: "+name, "NOT_FOUND")
+}
+
+func (s *Server) handleDeleteSkill(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	if err := validate.SkillName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
+	// Check if skill exists
+	if _, err := s.store.GetSkill(r.Context(), name); err != nil {
+		writeError(w, http.StatusNotFound, "skill not found: "+name, "NOT_FOUND")
+		return
+	}
+	// Remove from DB
+	if err := s.store.DeleteSkill(r.Context(), name); err != nil {
+		slog.Error("failed to delete skill", "name", name, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to delete skill", "INTERNAL_ERROR")
+		return
+	}
+	// Remove from filesystem
+	skillDir := filepath.Join(s.skillsDir, name)
+	if dirExists(skillDir) {
+		if err := os.RemoveAll(skillDir); err != nil {
+			slog.Error("failed to remove skill directory", "dir", skillDir, "error", err)
+		}
+	}
+	// Remove from cache
+	s.removeCachedSkill(name)
+	slog.Info("skill deleted", "name", name)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": name})
 }
 
 func (s *Server) handleSearchSkills(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query().Get("q")
-	if query == "" {
-		cached := s.getCachedSkills()
-		writeJSON(w, 200, map[string]any{"ok": true, "query": "", "count": len(cached), "results": cached})
+	if err := validate.SearchQuery(query); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
 		return
 	}
-	if dbSkills, _ := s.store.SearchSkills(r.Context(), query); len(dbSkills) > 0 {
+	if query == "" {
+		cached := s.getCachedSkills()
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "query": "", "count": len(cached), "results": cached})
+		return
+	}
+	dbSkills, err := s.store.SearchSkills(r.Context(), query)
+	if err != nil {
+		slog.Error("database search failed", "query", query, "error", err)
+		// Fall back to memory search
+	} else if len(dbSkills) > 0 {
 		out := make([]localSkill, 0, len(dbSkills))
 		for _, sk := range dbSkills {
 			out = append(out, toLocalSkill(sk))
 		}
-		writeJSON(w, 200, map[string]any{"ok": true, "query": query, "count": len(out), "results": out})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "query": query, "count": len(out), "results": out})
 		return
 	}
+	// Fallback: memory search
 	cached := s.getCachedSkills()
 	pattern := strings.ToLower(query)
 	var out []localSkill
@@ -318,69 +535,119 @@ func (s *Server) handleSearchSkills(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "query": query, "count": len(out), "results": out})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "query": query, "count": len(out), "results": out})
 }
 
 func (s *Server) handleDownloadSkill(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
+	if err := validate.SkillName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
 	skillDir := filepath.Join(s.skillsDir, name)
 	if !dirExists(skillDir) {
-		writeError(w, 404, "skill not found: "+name)
+		writeError(w, http.StatusNotFound, "skill not found: "+name, "NOT_FOUND")
 		return
 	}
-	tmpDir, _ := os.MkdirTemp("", "soi-market-*")
-	defer os.RemoveAll(tmpDir)
-	zipPath := filepath.Join(tmpDir, name+".zip")
-	if err := createZip(skillDir, name, zipPath); err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	zipData, _ := os.ReadFile(zipPath)
+
+	// Stream ZIP directly to response (no temp file, no memory buffer)
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.zip"`, name))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(zipData)))
-	w.Write(zipData)
+	zw := zip.NewWriter(w)
+	defer zw.Close()
+
+	if err := filepath.Walk(skillDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(skillDir, path)
+		if err != nil {
+			return err
+		}
+		zf, err := zw.Create(filepath.ToSlash(filepath.Join(name, rel)))
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(zf, f)
+		return err
+	}); err != nil {
+		slog.Error("failed to create zip", "name", name, "error", err)
+		// Note: headers already sent, cannot change status code
+		return
+	}
 }
 
 func (s *Server) handleDownloadSkillFile(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
 	file := mux.Vars(r)["file"]
+	if err := validate.SkillName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
 	absPath := filepath.Join(s.skillsDir, name, file)
 	skillDir := filepath.Join(s.skillsDir, name)
 	if !strings.HasPrefix(filepath.Clean(absPath), filepath.Clean(skillDir)) {
-		writeError(w, 403, "path traversal denied")
+		writeError(w, http.StatusForbidden, "path traversal denied", "FORBIDDEN")
 		return
 	}
 	if !fileExists(absPath) {
-		writeError(w, 404, "file not found: "+file)
+		writeError(w, http.StatusNotFound, "file not found: "+file, "NOT_FOUND")
 		return
 	}
 	http.ServeFile(w, r, absPath)
 }
 
 func (s *Server) handleImportSkill(w http.ResponseWriter, r *http.Request) {
-	r.ParseMultipartForm(50 << 20)
+	if err := r.ParseMultipartForm(50 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "failed to parse multipart form: "+err.Error(), "BAD_REQUEST")
+		return
+	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		writeError(w, 400, "file field required")
+		writeError(w, http.StatusBadRequest, "file field required", "BAD_REQUEST")
 		return
 	}
 	defer file.Close()
 	ext := strings.ToLower(filepath.Ext(header.Filename))
 	if ext != ".zip" && ext != ".yaml" && ext != ".yml" && ext != ".md" {
-		writeError(w, 400, "unsupported format: "+ext)
+		writeError(w, http.StatusBadRequest, "unsupported format: "+ext, "BAD_REQUEST")
 		return
 	}
 	overwrite := r.FormValue("overwrite") == "true"
-	tmpFile, _ := os.CreateTemp("", "soi-market-import-*"+ext)
+
+	// Create temp file
+	tmpFile, err := os.CreateTemp("", "soi-market-import-*"+ext)
+	if err != nil {
+		slog.Error("failed to create temp file", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to create temp file", "INTERNAL_ERROR")
+		return
+	}
 	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
 	if _, err := io.Copy(tmpFile, file); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpFile.Name())
-		writeError(w, 500, "write upload: "+err.Error())
+		slog.Error("failed to write upload", "error", err)
+		writeError(w, http.StatusInternalServerError, "write upload: "+err.Error(), "INTERNAL_ERROR")
 		return
 	}
 	tmpFile.Close()
+
+	// Record install history start
+	history := &skillmarket.InstallHistory{
+		SkillName:  filepath.Base(header.Filename),
+		SourceURL:  "upload",
+		SourceType: "url",
+		Status:     "downloading",
+	}
+	if err := s.store.AddInstallHistory(r.Context(), history); err != nil {
+		slog.Error("failed to add install history", "error", err)
+	}
+
 	var skillName string
 	if ext == ".zip" {
 		skillName, err = extractZip(tmpFile.Name(), s.skillsDir, overwrite)
@@ -388,12 +655,26 @@ func (s *Server) handleImportSkill(w http.ResponseWriter, r *http.Request) {
 		skillName, err = installYAMLFile(tmpFile.Name(), s.skillsDir, overwrite)
 	}
 	if err != nil {
-		writeError(w, 500, err.Error())
+		slog.Error("skill import failed", "error", err)
+		if history.ID > 0 {
+			s.store.UpdateInstallHistory(r.Context(), history.ID, "failed", err.Error())
+		}
+		writeError(w, http.StatusInternalServerError, err.Error(), "INTERNAL_ERROR")
 		return
 	}
+
+	// Validate skill name
+	if vErr := validate.SkillName(skillName); vErr != nil {
+		if history.ID > 0 {
+			s.store.UpdateInstallHistory(r.Context(), history.ID, "failed", vErr.Error())
+		}
+		writeError(w, http.StatusBadRequest, vErr.Error(), "BAD_REQUEST")
+		return
+	}
+
 	skDir := filepath.Join(s.skillsDir, skillName)
 	newSK := localSkill{Name: skillName, Path: skillName, Size: dirSize(skDir), Source: "market"}
-	if yd, _ := os.ReadFile(filepath.Join(skDir, "skill.yaml")); yd != nil {
+	if yd, err := os.ReadFile(filepath.Join(skDir, "skill.yaml")); err == nil && yd != nil {
 		populateSkillFromYAML(yd, &newSK)
 	}
 	if _, err := os.Stat(filepath.Join(skDir, "wasm", "plugin.wasm")); err == nil {
@@ -404,18 +685,84 @@ func (s *Server) handleImportSkill(w http.ResponseWriter, r *http.Request) {
 	}
 	newSK.Size = dirSize(skDir)
 	s.appendCachedSkill(newSK)
-	s.store.UpsertSkill(r.Context(), &skillmarket.InstalledSkill{Name: newSK.Name, Version: newSK.Version, Description: newSK.Description, Author: newSK.Author, Runtime: newSK.Runtime, Tags: newSK.Tags, Tools: newSK.Tools, HasWasm: newSK.HasWasm, HasSoi: newSK.HasSoi, SizeBytes: newSK.Size, SourceType: "market", InstallTime: time.Now()})
+	if err := s.store.UpsertSkill(r.Context(), &skillmarket.InstalledSkill{
+		Name: newSK.Name, Version: newSK.Version, Description: newSK.Description,
+		Author: newSK.Author, Runtime: newSK.Runtime, Tags: newSK.Tags, Tools: newSK.Tools,
+		HasWasm: newSK.HasWasm, HasSoi: newSK.HasSoi, SizeBytes: newSK.Size,
+		SourceType: "market", InstallTime: time.Now(),
+	}); err != nil {
+		slog.Error("failed to upsert skill", "name", skillName, "error", err)
+	}
+	if history.ID > 0 {
+		s.store.UpdateInstallHistory(r.Context(), history.ID, "success", "")
+	}
 	slog.Info("skill imported via market", "name", skillName)
-	writeJSON(w, 200, map[string]any{"ok": true, "name": skillName})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": skillName})
 }
+
+// --- History ---
+
+func (s *Server) handleListHistory(w http.ResponseWriter, r *http.Request) {
+	history, err := s.store.ListInstallHistory(r.Context(), 0)
+	if err != nil {
+		slog.Error("failed to list history", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to list history", "INTERNAL_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(history), "items": history})
+}
+
+func (s *Server) handleSkillHistory(w http.ResponseWriter, r *http.Request) {
+	name := mux.Vars(r)["name"]
+	if err := validate.SkillName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "BAD_REQUEST")
+		return
+	}
+	allHistory, err := s.store.ListInstallHistory(r.Context(), 0)
+	if err != nil {
+		slog.Error("failed to list history", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to list history", "INTERNAL_ERROR")
+		return
+	}
+	var filtered []*skillmarket.InstallHistory
+	for _, h := range allHistory {
+		if h.SkillName == name {
+			filtered = append(filtered, h)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(filtered), "items": filtered})
+}
+
+// --- Stats ---
 
 func (s *Server) handleStats(w http.ResponseWriter, _ *http.Request) {
-	st, _ := s.store.Stats(context.Background())
-	writeJSON(w, 200, map[string]any{"ok": true, "stats": map[string]any{"skill_count": st.SkillCount, "source_count": st.SourceCount, "total_size": st.TotalSize, "market_sources": len(s.market.ListSources())}})
+	st, err := s.store.Stats(context.Background())
+	if err != nil {
+		slog.Error("failed to get stats", "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to get stats", "INTERNAL_ERROR")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true,
+		"stats": map[string]any{
+			"skill_count":    st.SkillCount,
+			"source_count":   st.SourceCount,
+			"total_size":     st.TotalSize,
+			"market_sources": len(s.market.ListSources()),
+		},
+	})
 }
 
+// =============================================================================
+// Helpers
+// =============================================================================
+
 func scanLocalSkills(dir string) []localSkill {
-	entries, _ := os.ReadDir(dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		slog.Error("failed to read skills dir", "dir", dir, "error", err)
+		return nil
+	}
 	var out []localSkill
 	for _, e := range entries {
 		if !e.IsDir() {
@@ -423,7 +770,7 @@ func scanLocalSkills(dir string) []localSkill {
 		}
 		d := filepath.Join(dir, e.Name())
 		sk := localSkill{Name: e.Name(), Path: e.Name(), Source: "market"}
-		if yd, _ := os.ReadFile(filepath.Join(d, "skill.yaml")); yd != nil {
+		if yd, err := os.ReadFile(filepath.Join(d, "skill.yaml")); err == nil && yd != nil {
 			populateSkillFromYAML(yd, &sk)
 		}
 		if _, err := os.Stat(filepath.Join(d, "wasm", "plugin.wasm")); err == nil {
@@ -465,12 +812,18 @@ func createZip(srcDir, prefix, dest string) error {
 		if err != nil || info.IsDir() {
 			return nil
 		}
-		rel, _ := filepath.Rel(srcDir, path)
+		rel, err := filepath.Rel(srcDir, path)
+		if err != nil {
+			return err
+		}
 		zf, err := w.Create(filepath.ToSlash(filepath.Join(prefix, rel)))
 		if err != nil {
 			return err
 		}
-		data, _ := os.ReadFile(path)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
 		_, err = zf.Write(data)
 		return err
 	})
@@ -482,6 +835,12 @@ func extractZip(zipPath, destDir string, override bool) (string, error) {
 		return "", fmt.Errorf("open zip: %w", err)
 	}
 	defer r.Close()
+
+	// ZIP bomb protection
+	limits := validate.DefaultZipLimits
+	var totalSize int64
+	var fileCount int
+
 	var name string
 	for _, f := range r.File {
 		if p := strings.SplitN(f.Name, "/", 2); p[0] != "" && p[0] != "." {
@@ -492,13 +851,34 @@ func extractZip(zipPath, destDir string, override bool) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("cannot determine skill name from zip")
 	}
+
 	target := filepath.Join(destDir, name)
 	if !override && dirExists(target) {
 		return "", fmt.Errorf("skill %q already exists (use overwrite=true)", name)
 	}
 	os.RemoveAll(target)
 	os.MkdirAll(target, 0755)
+
 	for _, f := range r.File {
+		fileCount++
+		if fileCount > limits.MaxFileCount {
+			os.RemoveAll(target)
+			return "", fmt.Errorf("zip contains too many files (max %d)", limits.MaxFileCount)
+		}
+		if f.UncompressedSize64 > uint64(limits.MaxFileSize) {
+			os.RemoveAll(target)
+			return "", fmt.Errorf("zip file %q exceeds max size %d bytes", f.Name, limits.MaxFileSize)
+		}
+		totalSize += int64(f.UncompressedSize64)
+		if totalSize > limits.MaxTotalSize {
+			os.RemoveAll(target)
+			return "", fmt.Errorf("zip total uncompressed size exceeds %d bytes", limits.MaxTotalSize)
+		}
+		if len(f.Name) > limits.MaxPathLength {
+			os.RemoveAll(target)
+			return "", fmt.Errorf("zip path too long: %q", f.Name)
+		}
+
 		parts := strings.SplitN(f.Name, "/", 2)
 		rel := ""
 		if len(parts) > 1 {
@@ -516,8 +896,8 @@ func extractZip(zipPath, destDir string, override bool) (string, error) {
 			continue
 		}
 		os.MkdirAll(filepath.Dir(dest), 0755)
-		rc, _ := f.Open()
-		if rc == nil {
+		rc, err := f.Open()
+		if err != nil {
 			continue
 		}
 		out, err := os.Create(dest)
@@ -570,12 +950,32 @@ func extractYAMLName(data []byte) string {
 	return ""
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
+// =============================================================================
+// Middleware
+// =============================================================================
+
+func corsMiddleware(next http.Handler, allowedOrigins []string) http.Handler {
+	allowAll := false
+	originMap := make(map[string]struct{})
+	for _, o := range allowedOrigins {
+		if o == "*" {
+			allowAll = true
+			break
+		}
+		originMap[o] = struct{}{}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		origin := r.Header.Get("Origin")
+		if allowAll {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else if origin != "" {
+			if _, ok := originMap[origin]; ok {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key, X-Requested-With")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -597,7 +997,13 @@ func loggingMiddleware(next http.Handler) http.Handler {
 		} else if lrw.status >= 400 {
 			lvl = slog.LevelWarn
 		}
-		slog.Log(context.Background(), lvl, "request", "method", r.Method, "path", r.URL.Path, "status", lrw.status, "duration_ms", dur.Milliseconds())
+		slog.Log(context.Background(), lvl, "request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", lrw.status,
+			"duration_ms", dur.Milliseconds(),
+			"remote_addr", r.RemoteAddr,
+		)
 	})
 }
 
@@ -608,15 +1014,31 @@ type loggingRW struct {
 
 func (l *loggingRW) WriteHeader(code int) { l.status = code; l.ResponseWriter.WriteHeader(code) }
 
+// =============================================================================
+// Response helpers
+// =============================================================================
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"ok": "false", "error": msg})
+func writeError(w http.ResponseWriter, status int, msg string, code string) {
+	writeJSON(w, status, map[string]any{"ok": false, "error": msg, "code": code})
 }
+
+// isNotFound checks if an error indicates a "not found" condition.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "not found")
+}
+
+// =============================================================================
+// File helpers
+// =============================================================================
 
 func dirExists(p string) bool {
 	info, err := os.Stat(p)

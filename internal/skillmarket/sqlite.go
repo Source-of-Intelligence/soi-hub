@@ -341,9 +341,15 @@ func (s *sqliteStore) Stats(ctx context.Context) (*Stats, error) {
 	defer s.mu.RUnlock()
 
 	var st Stats
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM installed_skills`).Scan(&st.SkillCount)
-	s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM market_sources`).Scan(&st.SourceCount)
-	s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes),0) FROM installed_skills`).Scan(&st.TotalSize)
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM installed_skills`).Scan(&st.SkillCount); err != nil {
+		return nil, fmt.Errorf("count skills: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM market_sources`).Scan(&st.SourceCount); err != nil {
+		return nil, fmt.Errorf("count sources: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes),0) FROM installed_skills`).Scan(&st.TotalSize); err != nil {
+		return nil, fmt.Errorf("sum size: %w", err)
+	}
 	return &st, nil
 }
 

@@ -1,0 +1,1341 @@
+openapi: 3.0.3
+info:
+  title: SkillHub (skill-market) API
+  description: |
+    Skill Market 服务 API -- 技能的发现（搜索）和分发（下载/安装）。
+    
+    本规范涵盖现有全部 12 个接口及建议扩展的接口端点。
+    现有接口标记为 `x-phase: existing`，新增接口标记为对应的实施阶段。
+  version: 2.0.0
+  contact:
+    name: SOI Team
+servers:
+  - url: http://localhost:9090
+    description: 本地开发服务
+
+tags:
+  - name: Health
+    description: 健康检查
+  - name: Market
+    description: 远程市场搜索与来源管理
+  - name: Skills
+    description: 已安装技能管理
+  - name: History
+    description: 安装历史记录
+  - name: Webhooks
+    description: Webhook 事件通知
+  - name: Monitoring
+    description: 监控与可观测性
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: 健康检查
+      operationId: healthCheck
+      x-phase: existing
+      responses:
+        '200':
+          description: 服务正常
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              example:
+                status: ok
+                service: skill-market
+
+  /api/v1/market/search:
+    get:
+      tags: [Market]
+      summary: 远程市场搜索
+      description: 在所有已启用的远程市场源中并发搜索技能
+      operationId: marketSearch
+      x-phase: existing
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: 搜索关键词
+          schema:
+            type: string
+            maxLength: 200
+      responses:
+        '200':
+          description: 搜索结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarketSearchResponse'
+        '500':
+          description: 搜索失败
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/market/sources:
+    get:
+      tags: [Market]
+      summary: 列出市场源
+      operationId: listSources
+      x-phase: existing
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+      responses:
+        '200':
+          description: 市场源列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourcesListResponse'
+    post:
+      tags: [Market]
+      summary: 添加市场源
+      description: 添加新的市场来源。需要 API Key 认证。
+      operationId: addSource
+      x-phase: existing
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSourceRequest'
+      responses:
+        '201':
+          description: 创建成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceResponse'
+        '400':
+          description: 参数无效
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/market/sources/{name}:
+    get:
+      tags: [Market]
+      summary: 获取市场源详情
+      operationId: getSource
+      x-phase: phase2
+      parameters:
+        - $ref: '#/components/parameters/SourceNameParam'
+      responses:
+        '200':
+          description: 市场源详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceResponse'
+        '404':
+          description: 源不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    put:
+      tags: [Market]
+      summary: 更新市场源
+      description: 更新市场源配置（enabled/priority）。需要 API Key 认证。
+      operationId: updateSource
+      x-phase: phase2
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceNameParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSourceRequest'
+      responses:
+        '200':
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SourceResponse'
+        '404':
+          description: 源不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags: [Market]
+      summary: 删除市场源
+      description: 按名称删除市场来源。需要 API Key 认证。
+      operationId: removeSource
+      x-phase: existing
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SourceNameParam'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  removed:
+                    type: string
+        '404':
+          description: 源不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/skills:
+    get:
+      tags: [Skills]
+      summary: 列出已安装技能
+      operationId: listSkills
+      x-phase: existing
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - name: runtime
+          in: query
+          description: 按运行时类型过滤
+          schema:
+            type: string
+            enum: [builtin, go, wasm, python, js, soi]
+        - name: status
+          in: query
+          description: 按状态过滤
+          schema:
+            type: string
+            enum: [active, inactive, error]
+        - name: sort
+          in: query
+          description: 排序字段
+          schema:
+            type: string
+            enum: [name, install_time, updated_at, size_bytes]
+            default: name
+        - name: order
+          in: query
+          description: 排序方向
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
+      responses:
+        '200':
+          description: 技能列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillsListResponse'
+
+  /api/v1/skills/search:
+    get:
+      tags: [Skills]
+      summary: 搜索本地技能
+      description: |
+        三层搜索策略：
+        1. q 为空 -> 返回全部
+        2. 先查数据库 (SQL LIKE)
+        3. DB 无结果 -> 内存缓存匹配
+      operationId: searchSkills
+      x-phase: existing
+      parameters:
+        - name: q
+          in: query
+          description: 搜索关键词
+          schema:
+            type: string
+            maxLength: 200
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+      responses:
+        '200':
+          description: 搜索结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillSearchResponse'
+
+  /api/v1/skills/{name}:
+    get:
+      tags: [Skills]
+      summary: 获取技能详情
+      operationId: getSkill
+      x-phase: existing
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      responses:
+        '200':
+          description: 技能详情
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillResponse'
+        '404':
+          description: 技能不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+    delete:
+      tags: [Skills]
+      summary: 卸载/删除技能
+      description: 从系统中卸载并删除指定技能。需要 API Key 认证。
+      operationId: deleteSkill
+      x-phase: phase2
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      responses:
+        '200':
+          description: 删除成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  removed:
+                    type: string
+        '404':
+          description: 技能不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/skills/{name}/download:
+    get:
+      tags: [Skills]
+      summary: 下载技能 ZIP 包
+      operationId: downloadSkill
+      x-phase: existing
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      responses:
+        '200':
+          description: ZIP 文件
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: 技能不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/skills/{name}/download/{file}:
+    get:
+      tags: [Skills]
+      summary: 下载技能内单个文件
+      operationId: downloadSkillFile
+      x-phase: existing
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+        - name: file
+          in: path
+          required: true
+          description: 技能目录内的文件相对路径
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 文件内容
+        '403':
+          description: 路径遍历攻击被阻止
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: 文件不存在
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/skills/import:
+    post:
+      tags: [Skills]
+      summary: 上传导入技能
+      description: |
+        上传技能包（ZIP/YAML/MD 格式）进行导入。
+        支持 .zip, .yaml, .yml, .md 格式。
+        需要 API Key 认证。
+      operationId: importSkill
+      x-phase: existing
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: 技能包文件
+                overwrite:
+                  type: boolean
+                  default: false
+                  description: 是否覆盖已存在的同名技能
+      responses:
+        '200':
+          description: 导入成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  name:
+                    type: string
+                    description: 导入的技能名称
+        '400':
+          description: 文件无效或不支持格式
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/skills/{name}/versions:
+    get:
+      tags: [Skills]
+      summary: 列出技能所有已安装版本
+      operationId: listSkillVersions
+      x-phase: phase4
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      responses:
+        '200':
+          description: 版本列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  name:
+                    type: string
+                  versions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/InstalledSkill'
+
+  /api/v1/skills/{name}/rollback:
+    post:
+      tags: [Skills]
+      summary: 回滚到指定版本
+      operationId: rollbackSkill
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version:
+                  type: string
+                  description: 目标回滚版本号
+      responses:
+        '200':
+          description: 回滚成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SkillResponse'
+
+  /api/v1/skills/{name}/ratings:
+    get:
+      tags: [Skills]
+      summary: 获取技能评分统计
+      operationId: getSkillRatings
+      x-phase: phase4
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      responses:
+        '200':
+          description: 评分统计
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  average:
+                    type: number
+                    format: float
+                  count:
+                    type: integer
+                  distribution:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    description: 各星级数量 {\"1\": 0, \"2\": 1, \"3\": 5, \"4\": 12, \"5\": 8}
+    post:
+      tags: [Skills]
+      summary: 提交技能评分
+      operationId: rateSkill
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [score]
+              properties:
+                score:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                  description: 评分 (1-5 星)
+                comment:
+                  type: string
+                  description: 评分备注
+      responses:
+        '201':
+          description: 评分成功
+
+  /api/v1/skills/{name}/comments:
+    get:
+      tags: [Skills]
+      summary: 获取技能评论列表
+      operationId: listSkillComments
+      x-phase: phase4
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+      responses:
+        '200':
+          description: 评论列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  page_size:
+                    type: integer
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Comment'
+    post:
+      tags: [Skills]
+      summary: 提交技能评论
+      operationId: commentSkill
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  minLength: 1
+                  maxLength: 2000
+                rating:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+      responses:
+        '201':
+          description: 评论成功
+
+  /api/v1/skills/{name}/dependencies:
+    get:
+      tags: [Skills]
+      summary: 查看技能依赖树
+      operationId: getSkillDependencies
+      x-phase: phase4
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      responses:
+        '200':
+          description: 依赖树
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  name:
+                    type: string
+                  dependencies:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DependencyNode'
+
+  /api/v1/skills/{name}/resolve:
+    post:
+      tags: [Skills]
+      summary: 解析并安装所有依赖
+      operationId: resolveSkillDependencies
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+      responses:
+        '200':
+          description: 依赖解析结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  resolved:
+                    type: array
+                    items:
+                      type: string
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        error:
+                          type: string
+
+  /api/v1/skills/batch/install:
+    post:
+      tags: [Skills]
+      summary: 批量安装技能
+      operationId: batchInstallSkills
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [skills]
+              properties:
+                skills:
+                  type: array
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                      version:
+                        type: string
+                      source:
+                        type: string
+      responses:
+        '200':
+          description: 批量安装结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  succeeded:
+                    type: array
+                    items:
+                      type: string
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        error:
+                          type: string
+
+  /api/v1/skills/batch/uninstall:
+    post:
+      tags: [Skills]
+      summary: 批量卸载技能
+      operationId: batchUninstallSkills
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [names]
+              properties:
+                names:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: 批量卸载结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  removed:
+                    type: array
+                    items:
+                      type: string
+                  not_found:
+                    type: array
+                    items:
+                      type: string
+
+  /api/v1/skills/batch/update:
+    post:
+      tags: [Skills]
+      summary: 批量更新技能
+      operationId: batchUpdateSkills
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [names]
+              properties:
+                names:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: 批量更新结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  updated:
+                    type: array
+                    items:
+                      type: string
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name:
+                          type: string
+                        error:
+                          type: string
+
+  /api/v1/history:
+    get:
+      tags: [History]
+      summary: 获取全局安装历史
+      operationId: listHistory
+      x-phase: phase2
+      parameters:
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+        - name: status
+          in: query
+          description: 按状态过滤
+          schema:
+            type: string
+            enum: [pending, downloading, success, failed]
+        - name: skill_name
+          in: query
+          description: 按技能名过滤
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 安装历史列表
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryListResponse'
+
+  /api/v1/skills/{name}/history:
+    get:
+      tags: [History]
+      summary: 获取技能安装历史
+      operationId: listSkillHistory
+      x-phase: phase2
+      parameters:
+        - $ref: '#/components/parameters/SkillNameParam'
+        - $ref: '#/components/parameters/PageParam'
+        - $ref: '#/components/parameters/PageSizeParam'
+      responses:
+        '200':
+          description: 技能安装历史
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryListResponse'
+
+  /api/v1/stats:
+    get:
+      tags: [Skills]
+      summary: 获取统计信息
+      operationId: getStats
+      x-phase: existing
+      responses:
+        '200':
+          description: 统计信息
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsResponse'
+
+  /api/v1/webhooks:
+    get:
+      tags: [Webhooks]
+      summary: 列出已注册 Webhook
+      operationId: listWebhooks
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Webhook 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Webhook'
+    post:
+      tags: [Webhooks]
+      summary: 注册 Webhook
+      operationId: createWebhook
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+      responses:
+        '201':
+          description: 注册成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Webhook'
+
+  /api/v1/webhooks/{id}:
+    delete:
+      tags: [Webhooks]
+      summary: 删除 Webhook
+      operationId: deleteWebhook
+      x-phase: phase4
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: 删除成功
+
+  /metrics:
+    get:
+      tags: [Monitoring]
+      summary: Prometheus 指标
+      description: 暴露 Prometheus 格式的监控指标
+      operationId: metrics
+      x-phase: phase4
+      responses:
+        '200':
+          description: Prometheus 文本格式指标
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/v1/docs:
+    get:
+      tags: [Monitoring]
+      summary: API 文档 (Swagger UI)
+      description: 返回 Swagger UI 页面
+      operationId: apiDocs
+      x-phase: phase4
+      responses:
+        '200':
+          description: Swagger UI HTML 页面
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API Key 认证，通过请求头 X-API-Key 传递
+
+  parameters:
+    SkillNameParam:
+      name: name
+      in: path
+      required: true
+      description: 技能名称
+      schema:
+        type: string
+        pattern: '^[a-zA-Z0-9_-]+$'
+    SourceNameParam:
+      name: name
+      in: path
+      required: true
+      description: 市场源名称
+      schema:
+        type: string
+    PageParam:
+      name: page
+      in: query
+      description: 页码
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSizeParam:
+      name: page_size
+      in: query
+      description: 每页数量
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        service:
+          type: string
+          example: skill-market
+
+    ErrorResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+          example: false
+        error:
+          type: string
+        code:
+          type: string
+          description: 错误码 (NOT_FOUND, BAD_REQUEST, INTERNAL_ERROR 等)
+
+    MarketSearchResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        query:
+          type: string
+        count:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchResult'
+
+    SearchResult:
+      type: object
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        description:
+          type: string
+        author:
+          type: string
+        downloads:
+          type: integer
+        rating:
+          type: number
+          format: float
+        tags:
+          type: array
+          items:
+            type: string
+        source:
+          type: string
+        installUrl:
+          type: string
+        compatibility:
+          type: object
+          additionalProperties:
+            type: boolean
+
+    MarketSource:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        url:
+          type: string
+          format: uri
+        type:
+          type: string
+          example: http
+        enabled:
+          type: boolean
+        priority:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateSourceRequest:
+      type: object
+      required: [name, url]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        url:
+          type: string
+          format: uri
+          description: 仅允许 http/https 协议
+        type:
+          type: string
+          default: http
+        enabled:
+          type: boolean
+          default: true
+        priority:
+          type: integer
+          default: 5
+
+    UpdateSourceRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        priority:
+          type: integer
+
+    SourceResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/MarketSource'
+
+    SourcesListResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        count:
+          type: integer
+        sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/MarketSource'
+
+    InstalledSkill:
+      type: object
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        description:
+          type: string
+        author:
+          type: string
+        runtime:
+          type: string
+          enum: [builtin, go, wasm, python, js, soi]
+        tags:
+          type: array
+          items:
+            type: string
+        tools:
+          type: array
+          items:
+            type: string
+        source_url:
+          type: string
+        source_type:
+          type: string
+          enum: [local, market, url, git]
+        has_wasm:
+          type: boolean
+        has_soi:
+          type: boolean
+        size_bytes:
+          type: integer
+          format: int64
+        checksum:
+          type: string
+        status:
+          type: string
+          enum: [active, inactive, error]
+        install_time:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SkillResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        data:
+          $ref: '#/components/schemas/InstalledSkill'
+
+    SkillsListResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        count:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/InstalledSkill'
+
+    SkillSearchResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        query:
+          type: string
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        count:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/InstalledSkill'
+
+    StatsResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        stats:
+          type: object
+          properties:
+            skill_count:
+              type: integer
+            source_count:
+              type: integer
+            total_size:
+              type: integer
+              format: int64
+            market_sources:
+              type: integer
+
+    InstallHistory:
+      type: object
+      properties:
+        id:
+          type: integer
+        skill_name:
+          type: string
+        skill_version:
+          type: string
+        source_url:
+          type: string
+        source_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, downloading, success, failed]
+        error_message:
+          type: string
+        checksum:
+          type: string
+        file_size:
+          type: integer
+          format: int64
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    HistoryListResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        total:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/InstallHistory'
+
+    Comment:
+      type: object
+      properties:
+        id:
+          type: integer
+        author:
+          type: string
+        content:
+          type: string
+        rating:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    DependencyNode:
+      type: object
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        installed:
+          type: boolean
+        dependencies:
+          type: array
+          items:
+            $ref: '#/components/schemas/DependencyNode'
+
+    Webhook:
+      type: object
+      properties:
+        id:
+          type: integer
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum: [skill.installed, skill.updated, skill.removed, source.added, source.removed]
+        secret:
+          type: string
+          description: HMAC 签名密钥 (创建时返回，后续不显示)
+        created_at:
+          type: string
+          format: date-time
+
+    CreateWebhookRequest:
+      type: object
+      required: [url, events]
+      properties:
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum: [skill.installed, skill.updated, skill.removed, source.added, source.removed]
+          minItems: 1
+        secret:
+          type: string
+          description: 可选的 HMAC 签名密钥，如不提供则自动生成

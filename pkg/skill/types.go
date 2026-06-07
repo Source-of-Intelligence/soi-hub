@@ -53,6 +53,15 @@ type Spec struct {
 	Permissions Permissions `yaml:"permissions,omitempty"`
 }
 
+// Trigger defines trigger configuration at provides level.
+type Trigger struct {
+	Keywords []string `yaml:"keywords,omitempty"`
+	Prefix   string   `yaml:"prefix,omitempty"`
+	Regex    string   `yaml:"regex,omitempty"`
+	Events   []string `yaml:"events,omitempty"`
+	Priority int      `yaml:"priority,omitempty"`
+}
+
 // Runtime configuration.
 type Runtime struct {
 	// Runtime type: "builtin", "go", "wasm", "python", "js", "soi"
@@ -63,6 +72,8 @@ type Runtime struct {
 	Main string `yaml:"main,omitempty"`
 	// WASM-specific configuration
 	Wasm *RuntimeWasmConfig `yaml:"wasm,omitempty"`
+	// Sandbox capabilities (for SOI plugins)
+	Uses []string `yaml:"uses,omitempty"`
 }
 
 // RuntimeWasmConfig is the WASM runtime configuration.
@@ -93,6 +104,8 @@ type Dependency struct {
 type Provides struct {
 	// Tools provided by this skill
 	Tools []ToolDef `yaml:"tools,omitempty"`
+	// Trigger configuration at provides level
+	Trigger *Trigger `yaml:"trigger,omitempty"`
 	// Prompts provided by this skill
 	Prompts []PromptDef `yaml:"prompts,omitempty"`
 	// Resources provided by this skill

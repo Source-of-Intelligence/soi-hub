@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -11,6 +12,7 @@ import (
 // config is the top-level configuration for the skill-market service.
 type config struct {
 	Server  ServerConfig  `mapstructure:"server"`
+	Auth    AuthConfig    `mapstructure:"auth"`
 	Storage StorageConfig `mapstructure:"storage"`
 	Market  MarketConfig  `mapstructure:"market"`
 }
@@ -18,6 +20,11 @@ type config struct {
 type ServerConfig struct {
 	Host string `mapstructure:"host"`
 	Port int    `mapstructure:"port"`
+}
+
+type AuthConfig struct {
+	APIKeys     []string `mapstructure:"api_keys"`
+	CORSOrigins []string `mapstructure:"cors_origins"`
 }
 
 type StorageConfig struct {
@@ -40,6 +47,7 @@ type MarketSourceConfig struct {
 func defaultConfig() *config {
 	return &config{
 		Server:  ServerConfig{Host: "0.0.0.0", Port: 9090},
+		Auth:    AuthConfig{CORSOrigins: []string{"*"}},
 		Storage: StorageConfig{DB: "./data/sm.db", SkillsDir: "./skills"},
 		Market: MarketConfig{
 			Sources: []MarketSourceConfig{{Name: "official", URL: "https://raw.githubusercontent.com/soi-dev/skills/main/index.json", Type: "http", Enabled: true, Priority: 10}},
@@ -105,6 +113,27 @@ func (c *config) applyEnv() {
 	if v := os.Getenv("SKILL_MARKET_DB"); v != "" {
 		c.Storage.DB = v
 	}
+	if v := os.Getenv("SKILL_MARKET_API_KEYS"); v != "" {
+		c.Auth.APIKeys = splitEnvList(v)
+	}
+	if v := os.Getenv("SKILL_MARKET_CORS_ORIGINS"); v != "" {
+		c.Auth.CORSOrigins = splitEnvList(v)
+	}
+}
+
+func splitEnvList(v string) []string {
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (c *config) absSkillsDir() string {
