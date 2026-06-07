@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -842,10 +843,40 @@ func extractZip(zipPath, destDir string, override bool) (string, error) {
 	var fileCount int
 
 	var name string
+	var incomingVersion string
+	// 先查找 skill.yaml 文件以获取版本号
 	for _, f := range r.File {
-		if p := strings.SplitN(f.Name, "/", 2); p[0] != "" && p[0] != "." {
-			name = p[0]
-			break
+		if strings.HasSuffix(f.Name, "/skill.yaml") || f.Name == "skill.yaml" {
+			// 获取技能名称
+			if name == "" {
+				if p := strings.SplitN(f.Name, "/", 2); len(p) > 1 && p[0] != "" && p[0] != "." {
+					name = p[0]
+				} else if p := strings.SplitN(f.Name, "/", 2); len(p) == 1 {
+					// 如果没有目录结构，先从文件名推断，但我们还是先读取内容
+					name = ""
+				}
+			}
+			// 读取 skill.yaml 内容
+			rc, err := f.Open()
+			if err == nil {
+				var yamlData []byte
+				yamlData, err = io.ReadAll(rc)
+				rc.Close()
+				if err == nil {
+					var ym yamlMeta
+					if yaml.Unmarshal(yamlData, &ym) == nil {
+						if name == "" {
+							name = ym.Metadata.Name
+						}
+						incomingVersion = ym.Metadata.Version
+					}
+				}
+			}
+		}
+		if name == "" {
+			if p := strings.SplitN(f.Name, "/", 2); p[0] != "" && p[0] != "." {
+				name = p[0]
+			}
 		}
 	}
 	if name == "" {
@@ -853,10 +884,36 @@ func extractZip(zipPath, destDir string, override bool) (string, error) {
 	}
 
 	target := filepath.Join(destDir, name)
-	if !override && dirExists(target) {
-		return "", fmt.Errorf("skill %q already exists (use overwrite=true)", name)
+	if dirExists(target) {
+		// 检查是否需要覆盖
+		if override {
+			// 强制覆盖
+			os.RemoveAll(target)
+		} else {
+			// 获取现有版本
+			var existingVersion string
+			existingSkillYaml := filepath.Join(target, "skill.yaml")
+			if fileExists(existingSkillYaml) {
+				if yamlData, err := os.ReadFile(existingSkillYaml); err == nil {
+					var ym yamlMeta
+					if yaml.Unmarshal(yamlData, &ym) == nil {
+						existingVersion = ym.Metadata.Version
+					}
+				}
+			}
+
+			// 比较版本
+			compResult := compareVersions(incomingVersion, existingVersion)
+			if compResult <= 0 {
+				if compResult == 0 {
+					return "", fmt.Errorf("skill %q with version %q already exists and is not newer", name, incomingVersion)
+				}
+				return "", fmt.Errorf("skill %q with version %q is not newer than existing version %q", name, incomingVersion, existingVersion)
+			}
+			// 版本更高，可以覆盖
+			os.RemoveAll(target)
+		}
 	}
-	os.RemoveAll(target)
 	os.MkdirAll(target, 0755)
 
 	for _, f := range r.File {
@@ -921,9 +978,37 @@ func installYAMLFile(src, destDir string, override bool) (string, error) {
 	if name == "" {
 		name = strings.TrimSuffix(filepath.Base(src), filepath.Ext(src))
 	}
+	// 获取新版本号
+	var incomingVersion string
+	var ym yamlMeta
+	if yaml.Unmarshal(data, &ym) == nil {
+		incomingVersion = ym.Metadata.Version
+	}
+
 	target := filepath.Join(destDir, name+".yaml")
-	if !override && fileExists(target) {
-		return "", fmt.Errorf("skill %q already exists (use overwrite=true)", name)
+	if fileExists(target) {
+		// 检查是否需要覆盖
+		if override {
+			// 强制覆盖
+		} else {
+			// 获取现有版本
+			var existingVersion string
+			if existingData, err := os.ReadFile(target); err == nil {
+				var existingYaml yamlMeta
+				if yaml.Unmarshal(existingData, &existingYaml) == nil {
+					existingVersion = existingYaml.Metadata.Version
+				}
+			}
+
+			// 比较版本
+			compResult := compareVersions(incomingVersion, existingVersion)
+			if compResult <= 0 {
+				if compResult == 0 {
+					return "", fmt.Errorf("skill %q with version %q already exists and is not newer", name, incomingVersion)
+				}
+				return "", fmt.Errorf("skill %q with version %q is not newer than existing version %q", name, incomingVersion, existingVersion)
+			}
+		}
 	}
 	if err := os.WriteFile(target, data, 0644); err != nil {
 		return "", err
@@ -1059,4 +1144,49 @@ func dirSize(p string) int64 {
 		return nil
 	})
 	return s
+}
+
+// compareVersions 比较两个版本号
+// 返回 1 表示 v1 > v2
+// 返回 -1 表示 v1 < v2
+// 返回 0 表示 v1 == v2
+func compareVersions(v1, v2 string) int {
+	// 处理空版本号
+	if v1 == "" && v2 == "" {
+		return 0
+	}
+	if v1 == "" {
+		return -1
+	}
+	if v2 == "" {
+		return 1
+	}
+
+	// 分割版本号
+	parts1 := strings.Split(strings.TrimSpace(v1), ".")
+	parts2 := strings.Split(strings.TrimSpace(v2), ".")
+
+	// 比较每一部分
+	maxLen := len(parts1)
+	if len(parts2) > maxLen {
+		maxLen = len(parts2)
+	}
+
+	for i := 0; i < maxLen; i++ {
+		var p1, p2 int
+		if i < len(parts1) {
+			p1, _ = strconv.Atoi(parts1[i])
+		}
+		if i < len(parts2) {
+			p2, _ = strconv.Atoi(parts2[i])
+		}
+
+		if p1 > p2 {
+			return 1
+		} else if p1 < p2 {
+			return -1
+		}
+	}
+
+	return 0
 }
